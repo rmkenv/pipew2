@@ -1,0 +1,7 @@
+Flask==3.0.0
+flask-cors==4.0.0
+anthropic==0.39.0
+pypdf==4.0.1
+requests==2.31.0
+gunicorn==21.2.0
+Werkzeug==3.0.1
