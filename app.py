@@ -47,8 +47,9 @@ EMBEDDED_WHITELIST = [
 ]
 
 SESSION_EXPIRY_HOURS = int(os.getenv("SESSION_EXPIRY_HOURS", "24"))
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Prefer Streamlit secrets if available
+DEFAULT_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 # --- Domain data (unchanged) ---
 JOB_ROLES = {
@@ -71,7 +72,7 @@ DEPARTMENT_PROMPTS = {
     "administration": {"name": "Administration & Planning", "prompt": "You are a specialized AI assistant for DPW Administration & Planning. You help with budgeting, project planning, and departmental management."}
 }
 
-# --- Whitelist helpers (mostly unchanged) ---
+# --- Whitelist helpers ---
 def fetch_whitelist() -> List[str]:
     try:
         resp = requests.get(WHITELIST_URL, timeout=15)
@@ -117,7 +118,7 @@ def enforce_whitelist_on_text(text: str, whitelist_urls: List[str]) -> str:
            "\n\nPlease revise citations to use only approved sources."
     return text + note
 
-# --- PDF extraction (unchanged) ---
+# --- PDF extraction ---
 def extract_text_from_pdf(content: bytes) -> str:
     if not PDF_EXTRACTION_AVAILABLE:
         return "[ERROR: PDF extraction library not installed. Install pypdf or PyPDF2.]"
@@ -144,7 +145,7 @@ def extract_text_from_pdf(content: bytes) -> str:
         logger.exception("PDF extraction error")
         return f"[Error extracting PDF text: {str(e)}]"
 
-# --- Prompt building (unchanged) ---
+# --- Prompt building ---
 def get_role_info(role_key: str):
     role = JOB_ROLES.get(role_key)
     if role:
@@ -172,8 +173,8 @@ def build_system_prompt(dept_key: str, role_key: Optional[str], whitelist_urls: 
     )
     return base + role_txt + whitelist_notice
 
-# --- Gemini client and response generation (largely unchanged) ---
-def init_clients():
+# --- Gemini client and response generation ---
+def init_clients(api_key: str):
     timeout_config = httpx.Timeout(connect=90.0, read=240.0, write=90.0, pool=60.0)
     limits_config = httpx.Limits(max_connections=50, max_keepalive_connections=10, keepalive_expiry=30.0)
     try:
@@ -184,7 +185,7 @@ def init_clients():
         logger.warning(f"SSL verify failed for httpx: {e}. Falling back to verify=False")
         http_client = httpx.Client(timeout=timeout_config, limits=limits_config, verify=False,
                                    http2=False, follow_redirects=True)
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+    gemini_client = genai.Client(api_key=api_key) if api_key else None
     return http_client, gemini_client
 
 def generate_mock_response(query: str, context: str, system_prompt: str, has_document: bool) -> str:
@@ -195,7 +196,7 @@ def generate_mock_response(query: str, context: str, system_prompt: str, has_doc
 Your question: {query}
 
 This is a demonstration response. To get real AI-powered answers:
-1. Set the GEMINI_API_KEY environment variable.
+1. Set the GEMINI_API_KEY secret or environment variable.
 2. Rerun the app.
 
 Configuration:
@@ -219,10 +220,11 @@ def generate_llm_response(query: str, context: str, system_prompt: str, has_docu
     base_delay = 5.0
     for attempt in range(max_retries):
         try:
+            # FIX: removed timeout from config
             resp = gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=contents,
-                config={"max_output_tokens": 8192, "temperature": 0.7, "timeout": 240.0}
+                config={"max_output_tokens": 8192, "temperature": 0.7}
             )
             if getattr(resp, "candidates", None) and resp.candidates[0].content.parts:
                 return resp.text
@@ -258,8 +260,10 @@ if "document_context" not in st.session_state:
     st.session_state.document_context = ""
 if "questions" not in st.session_state:
     st.session_state.questions = []
+if "api_key" not in st.session_state:
+    st.session_state.api_key = DEFAULT_API_KEY
 if "http_client" not in st.session_state or "gemini_client" not in st.session_state:
-    st.session_state.http_client, st.session_state.gemini_client = init_clients()
+    st.session_state.http_client, st.session_state.gemini_client = init_clients(st.session_state.api_key)
 
 st.set_page_config(page_title="PipeWrench AI", layout="wide")
 st.title("PipeWrench AI - Municipal DPW Knowledge Capture (Streamlit)")
@@ -269,16 +273,19 @@ with st.sidebar:
     dept = st.selectbox("Department", list(DEPARTMENT_PROMPTS.keys()), index=0, format_func=lambda k: DEPARTMENT_PROMPTS[k]["name"])
     role = st.selectbox("Role", list(JOB_ROLES.keys()), index=0, format_func=lambda k: JOB_ROLES[k]["name"])
     st.text(f"Model: {GEMINI_MODEL}")
-    api_key_input = st.text_input("GEMINI_API_KEY (optional if set in env)", type="password")
-    if api_key_input and api_key_input != GEMINI_API_KEY:
-        GEMINI_API_KEY = api_key_input
-        st.session_state.http_client, st.session_state.gemini_client = init_clients()
-        st.success("Gemini client reinitialized with provided key.")
-
+    key_in = st.text_input("GEMINI_API_KEY (from Secrets or enter here)", type="password", value=st.session_state.api_key)
+    if st.button("Apply API Key"):
+        st.session_state.api_key = key_in
+        st.session_state.http_client, st.session_state.gemini_client = init_clients(st.session_state.api_key)
+        if st.session_state.gemini_client:
+            st.success("Gemini client initialized.")
+        else:
+            st.warning("No API key provided. Running in demo mode.")
     st.divider()
     st.write(f"Whitelisted URLs: {len(st.session_state.whitelist)}")
     st.write("Approved Domains:")
-    st.caption(", ".join(sorted(list(get_whitelisted_domains(st.session_state.whitelist)))[:10]) + ("..." if len(get_whitelisted_domains(st.session_state.whitelist)) > 10 else ""))
+    doms = get_whitelisted_domains(st.session_state.whitelist)
+    st.caption(", ".join(sorted(list(doms))[:10]) + ("..." if len(doms) > 10 else ""))
 
 col1, col2 = st.columns([2, 1])
 
